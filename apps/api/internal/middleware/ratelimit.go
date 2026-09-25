@@ -34,7 +34,7 @@ func RateLimit(rc RedisClient, lookup APIKeyLookup) func(http.Handler) http.Hand
 
 			ip := clientIP(r)
 			limit := 100
-			
+
 			// Check if authenticated
 			token := extractAPIKey(r)
 			if token != "" {

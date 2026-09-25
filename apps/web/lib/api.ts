@@ -2,19 +2,25 @@ import type {
   AlertsResponse,
   AlertSubscription,
   ContractDetail,
+  CompareResponse,
   ContractSnapshot,
   ContractSummary,
   ContractsListResponse,
   EventsResponse,
+  GlobalEventsResponse,
   GlobalStats,
   HealthChecksResponse,
   InvocationsResponse,
   MonitoredContract,
   MonitoredContractsResponse,
+  ReportFormat,
   StatsResponse,
   StorageResponse,
   TimeWindow,
   TrackContractRequest,
+  SLAHistoryResponse,
+  UptimeResponse,
+  UptimeWindow,
   WatchdogStats,
   CreateSubscriptionRequest,
   SubscriptionsResponse,
@@ -108,6 +114,7 @@ export function getContractEvents(
     tx_hash?: string;
     since?: string;
     until?: string;
+    in_successful_call?: boolean;
   },
 ): Promise<EventsResponse> {
   const search = new URLSearchParams();
@@ -117,6 +124,7 @@ export function getContractEvents(
   if (params?.tx_hash) search.set("tx_hash", params.tx_hash);
   if (params?.since) search.set("since", params.since);
   if (params?.until) search.set("until", params.until);
+  if (params?.in_successful_call !== undefined) search.set("in_successful_call", String(params.in_successful_call));
   const qs = search.toString();
   return fetchJson<EventsResponse>(
     `${API_URL}/api/v1/contracts/${id}/events${qs ? "?" + qs : ""}`,
@@ -144,6 +152,37 @@ export function getContractInvocations(
   const qs = search.toString();
   return fetchJson<InvocationsResponse>(
     `${API_URL}/api/v1/contracts/${id}/invocations${qs ? "?" + qs : ""}`,
+  );
+}
+
+// ---- global invocations ----------------------------------------------------
+
+/**
+ * Lists invocations across every tracked contract (newest first). Backs the
+ * /invocations explorer. All filters are optional.
+ */
+export function listInvocations(params?: {
+  cursor?: string;
+  limit?: number;
+  contract_id?: string;
+  fn?: string;
+  status?: string;
+  network?: string;
+  since?: string;
+  until?: string;
+}): Promise<InvocationsResponse> {
+  const search = new URLSearchParams();
+  if (params?.cursor) search.set("cursor", params.cursor);
+  if (params?.limit) search.set("limit", String(params.limit));
+  if (params?.contract_id) search.set("contract_id", params.contract_id);
+  if (params?.fn) search.set("fn", params.fn);
+  if (params?.status) search.set("status", params.status);
+  if (params?.network) search.set("network", params.network);
+  if (params?.since) search.set("since", params.since);
+  if (params?.until) search.set("until", params.until);
+  const qs = search.toString();
+  return fetchJson<InvocationsResponse>(
+    `${API_URL}/api/v1/invocations${qs ? "?" + qs : ""}`,
   );
 }
 
@@ -183,6 +222,26 @@ export function getContractStats(
 
 export function getGlobalStats(): Promise<GlobalStats> {
   return fetchJson<GlobalStats>(`${API_URL}/api/v1/stats/global`);
+}
+
+// ---- comparison -------------------------------------------------------------
+
+/**
+ * Fetch unified stats for up to 4 contracts in a single round-trip. The API
+ * fans out to the per-contract lookups in parallel and returns one entry per
+ * requested contract; a contract with no data yet still gets an entry with
+ * zeroed metrics rather than an error.
+ */
+export function getCompare(
+  ids: string[],
+  window: TimeWindow = "7d",
+): Promise<CompareResponse> {
+  const search = new URLSearchParams();
+  search.set("ids", ids.join(","));
+  search.set("window", window);
+  return fetchJson<CompareResponse>(
+    `${API_URL}/api/v1/compare?${search.toString()}`,
+  );
 }
 
 // ---- snapshot / replay ------------------------------------------------------
@@ -241,6 +300,50 @@ export function getMonitoredContract(
   );
 }
 
+export function getContractUptime(
+  contractId: string,
+  window: UptimeWindow = "24h",
+): Promise<UptimeResponse> {
+  return fetchJson<UptimeResponse>(
+    `${API_URL}/api/v1/watchdog/contracts/${contractId}/uptime?window=${window}`,
+  );
+}
+
+// ---- SLA reporting (issue #266) --------------------------------------------
+
+/**
+ * Monthly SLA buckets for the last `months` calendar months, oldest first.
+ * Backs the trend chart in one round-trip instead of a request per month.
+ */
+export function getContractReportHistory(
+  contractId: string,
+  months = 12,
+): Promise<SLAHistoryResponse> {
+  const search = new URLSearchParams({ months: String(months) });
+  return fetchJson<SLAHistoryResponse>(
+    `${API_URL}/api/v1/reports/${contractId}/history?${search.toString()}`,
+  );
+}
+
+/**
+ * URL for a report export. Returned rather than fetched so the browser can
+ * follow it as a download and honour Content-Disposition.
+ */
+export function contractReportUrl(
+  contractId: string,
+  month: string,
+  format: ReportFormat,
+): string {
+  const search = new URLSearchParams({ month, format });
+  return `${API_URL}/api/v1/reports/${contractId}?${search.toString()}`;
+}
+
+/** URL of the embeddable SVG SLA badge for a month. */
+export function contractSLABadgeUrl(contractId: string, month: string): string {
+  const search = new URLSearchParams({ month });
+  return `${API_URL}/api/v1/reports/${contractId}/badge.svg?${search.toString()}`;
+}
+
 export function listHealthChecks(
   contractId: string,
   limit = 100,
@@ -252,12 +355,18 @@ export function listHealthChecks(
 
 export function listAlerts(
   contractId?: string,
-  params?: { severity?: string; limit?: number; network?: string },
+  params?: {
+    severity?: string;
+    limit?: number;
+    network?: string;
+    cursor?: string;
+  },
 ): Promise<AlertsResponse> {
   const search = new URLSearchParams();
   if (params?.severity) search.set("severity", params.severity);
   if (params?.limit) search.set("limit", String(params.limit));
   if (params?.network) search.set("network", params.network);
+  if (params?.cursor) search.set("cursor", params.cursor);
   const qs = search.toString();
   const path = contractId
     ? `/api/v1/watchdog/contracts/${contractId}/alerts`
@@ -265,25 +374,79 @@ export function listAlerts(
   return fetchJson<AlertsResponse>(`${API_URL}${path}${qs ? "?" + qs : ""}`);
 }
 
+// ---- events explorer ------------------------------------------------------
+
+export interface ListAllEventsParams {
+  cursor?: string;
+  limit?: number;
+  contractId?: string;
+  type?: string;
+  network?: string;
+  /** RFC 3339 inclusive bounds on ledger_closed_at. */
+  since?: string;
+  until?: string;
+}
+
+/** Cross-contract events feed, newest first (GET /api/v1/events). */
+export function listAllEvents(
+  params: ListAllEventsParams = {},
+  init?: RequestInit,
+): Promise<GlobalEventsResponse> {
+  const search = new URLSearchParams();
+  if (params.cursor) search.set("cursor", params.cursor);
+  if (params.limit) search.set("limit", String(params.limit));
+  if (params.contractId) search.set("contract_id", params.contractId);
+  if (params.type) search.set("type", params.type);
+  if (params.network) search.set("network", params.network);
+  if (params.since) search.set("since", params.since);
+  if (params.until) search.set("until", params.until);
+  const qs = search.toString();
+  return fetchJson<GlobalEventsResponse>(
+    `${API_URL}/api/v1/events${qs ? "?" + qs : ""}`,
+    init,
+  );
+}
+
 // ---- subscriptions --------------------------------------------------------
+// Subscriptions hold integration secrets, so every call needs a contributor
+// identity; the dashboard forwards its browser user ID like trackContract.
+
+function userHeaders(userId?: string): Record<string, string> {
+  return userId ? { "X-User-ID": userId } : {};
+}
 
 export function createSubscription(
   req: CreateSubscriptionRequest,
+  userId?: string,
 ): Promise<AlertSubscription> {
   return fetchJson<AlertSubscription>(`${API_URL}/api/v1/watchdog/subscriptions`, {
     method: "POST",
     body: JSON.stringify(req),
+    headers: userHeaders(userId),
   });
 }
 
-export function listSubscriptions(): Promise<SubscriptionsResponse> {
-  return fetchJson<SubscriptionsResponse>(`${API_URL}/api/v1/watchdog/subscriptions`);
+export function listSubscriptions(userId?: string): Promise<SubscriptionsResponse> {
+  return fetchJson<SubscriptionsResponse>(`${API_URL}/api/v1/watchdog/subscriptions`, {
+    headers: userHeaders(userId),
+  });
 }
 
-export function deleteSubscription(id: string): Promise<void> {
-  return fetchJson<void>(`${API_URL}/api/v1/watchdog/subscriptions/${id}`, {
-    method: "DELETE",
-  });
+export async function deleteSubscription(id: string, userId?: string): Promise<void> {
+  const res = await fetch(
+    `${API_URL}/api/v1/watchdog/subscriptions/${encodeURIComponent(id)}`,
+    { method: "DELETE", headers: userHeaders(userId) },
+  );
+  if (!res.ok) {
+    let body: { error?: string | { message?: string } } = {};
+    try {
+      body = await res.json();
+    } catch {
+      // ignore parse error
+    }
+    const message = typeof body.error === "string" ? body.error : body.error?.message;
+    throw new ApiError(res.status, message || res.statusText);
+  }
 }
 
 // ---- watchlist ------------------------------------------------------------

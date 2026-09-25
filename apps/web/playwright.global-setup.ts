@@ -9,6 +9,7 @@ export default async function globalSetup(): Promise<void> {
     "/watchdog",
     "/watchdog/CAVRQGH5C3VRQGH5C3VRQGH5C3VRQGH5C3VRQGH5C3VRQGH5C3VRQGH5C33",
     "/playground",
+    "/settings",
   ];
 
   for (const path of paths) {

@@ -1,4 +1,4 @@
-# ARCHITECTURE.md
+# Architecture
 ## Sorolens System Architecture
 
 ---
@@ -55,7 +55,7 @@ This flow runs when a contract ID is first submitted to the system (either via t
    - Calls RPC getLedgerEntries for the contract instance entry
      - If not found: return 404 (contract does not exist on-chain)
    - Inserts row into `contracts` table with status = "backfilling"
-   - Returns 201 Accepted
+   - Returns 201 Created
 
 2. On next cron run (at most 5 minutes later), the indexer sees
    the contract in "backfilling" status.
@@ -176,11 +176,14 @@ CREATE TABLE events (
 -- Primary query pattern: all events for a contract, newest first.
 CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger DESC);
 
--- Support filtering by transaction hash (e.g. "show all events in this tx").
+-- Support filtering by transaction hash (e.g., "show all events in this tx").
 CREATE INDEX idx_events_tx_hash ON events (tx_hash);
 
 -- Time-range queries from the dashboard.
 CREATE INDEX idx_events_ledger_closed_at ON events (ledger_closed_at DESC);
+
+-- "Events for contract X within time range Y" (migration 000009).
+CREATE INDEX idx_events_contract_id_ledger_closed_at ON events (contract_id, ledger_closed_at);
 
 -- ============================================================
 -- invocations
@@ -313,6 +316,7 @@ CREATE INDEX idx_api_keys_hash ON api_keys (key_hash) WHERE revoked_at IS NULL;
 | `idx_events_contract_ledger` | The most common dashboard query: "show me recent events for contract X." Composite index with ledger DESC avoids sort. |
 | `idx_events_tx_hash` | Supports the invocation-detail page which shows all events emitted in a given transaction. |
 | `idx_events_ledger_closed_at` | Time-range filtering on the events feed. |
+| `idx_events_contract_id_ledger_closed_at` | Backs "events for contract X within time range Y" (contract stats window, daily activity aggregate). Leading on both columns bounds the scan; the contract/ledger index still reads every event for the contract and filters on `ledger_closed_at`. |
 | `idx_invocations_contract_ledger` | Same pattern as events; the invocation list is paginated with newest-first ordering. |
 | `idx_invocations_ledger_closed_at` | Time-range filter for resource-usage charts. |
 | `idx_invocations_status` | Supports the "show only failures" filter on the invocations list. |
@@ -328,6 +332,16 @@ All routes return `Content-Type: application/json`. Errors follow:
 ```json
 { "error": "human readable message", "code": "ERROR_CODE" }
 ```
+
+Request bodies are capped at 1 MiB by default. A request whose
+`Content-Length` exceeds the cap is rejected before its body is read, and any
+other body is bounded with `http.MaxBytesReader`; both paths return `413` with:
+
+```json
+{ "error": { "code": "PAYLOAD_TOO_LARGE", "message": "request body exceeds the 1048576 byte limit", "request_id": "..." } }
+```
+
+Set `REQUEST_MAX_BODY_BYTES` to change the cap.
 
 Cursor pagination uses an opaque `cursor` token (base64 of `{ledger}:{id}`) rather than offset. This is safe against inserts during pagination and aligns with how the RPC itself paginates.
 
@@ -351,6 +365,15 @@ A presented key that lacks the required scope receives `403` with
 `{"error":"missing scope","required":"<scope>"}`. Unknown or revoked keys
 receive `401`. Requests that present no credential keep the public v0.1 read
 surface open; API key management always requires a credential.
+
+#### Profiling: `/debug/pprof/*`
+
+The Go runtime profiling handlers (`net/http/pprof`) are mounted on the same
+router at `/debug/pprof/*` but are admin-only. Every request from a caller
+without the `admin` role — anonymous requests included — receives `403`, so
+the surface is not advertised. An admin gets the standard pprof index at
+`/debug/pprof/` and the named profiles (`goroutine`, `heap`, `allocs`, …),
+`cmdline`, `profile`, `symbol` and `trace` beneath it.
 
 ---
 
@@ -472,9 +495,69 @@ Paginated event list for a contract.
 }
 ```
 
+#### `GET /api/v1/events`
+
+Cross-contract events explorer feed (all tracked contracts), **newest first**.
+Backs the dashboard's `/events` page.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `cursor` | string | (none) | Opaque cursor from the previous page's `next_cursor`. |
+| `limit` | integer | 50 | Max 200. |
+| `contract_id` | string | (none) | Contract ID prefix, case-insensitive; a full ID matches one contract. `%` and `_` match literally. |
+| `type` | string | (none) | `contract`, `system` or `diagnostic`. |
+| `network` | string | (none) | `testnet`, `mainnet`, `futurenet` or `standalone`. |
+| `since` / `until` | RFC 3339 | (none) | Inclusive bounds on `ledger_closed_at`. |
+
+**Response `200`:** `{ "events": [Event + contract_id, network], "next_cursor": "…" }`.
+`next_cursor` is empty on the last page. The keyset cursor is the event ID
+(a ledger-ordered RPC paging token), so pages stay stable while new events
+are indexed.
+
 ---
 
 ### 4.3 Invocations
+
+#### `GET /api/v1/invocations`
+
+Global invocation explorer: resource usage for every tracked contract, newest
+first (`ledger DESC, tx_hash DESC`). Backs the dashboard's `/invocations` page.
+
+**Query params:** `cursor`, `limit` (default 50, max 200), `contract_id`, `fn`
+(function name), `status` (`SUCCESS`/`FAILED`/`NOT_FOUND`), `network`, `from` /
+`to` (ledger bounds), `since` / `until` (inclusive `ledger_closed_at` bounds, as
+`YYYY-MM-DD` or RFC3339).
+
+Pagination is keyset-based: the cursor encodes the `(ledger, tx_hash)` position,
+which is the sort tuple, so pages stay stable while the indexer appends rows.
+
+**Response `200`:**
+```json
+{
+  "invocations": [
+    {
+      "tx_hash": "32f7e5c3...",
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "network": "testnet",
+      "ledger": 490252,
+      "ledger_closed_at": "2026-07-26T10:00:21Z",
+      "status": "SUCCESS",
+      "function_name": "transfer",
+      "resource_fee_charged": 123456,
+      "cpu_insn": 4883530,
+      "mem_byte": 2298162,
+      "ledger_read_byte": 21812,
+      "ledger_write_byte": 1808
+    }
+  ],
+  "next_cursor": "NDkwMjUyOmFiYzEyMw=="
+}
+```
+
+`next_cursor` is an empty string on the last page. Invalid `cursor`, `since`,
+`until`, or `network` values return `422`.
+
+---
 
 #### `GET /api/v1/contracts/:id/invocations`
 
@@ -627,6 +710,81 @@ Network-wide summary across all tracked contracts.
 
 ---
 
+### 4.8 Dashboard summary
+
+#### `GET /api/v1/contracts/:id/summary`
+
+Composite document for the contract dashboard: totals, the newest event, the
+newest invocation, and the cached health score, so a page load costs one
+request instead of four. Each sub-query is an aggregate or a `LIMIT 1` newest-row
+lookup, so the work per request is constant (no per-row queries). Responses are
+memoized in-process for 5 seconds.
+
+**Responses:**
+- `200`: `{ contract_id, network, label, status, generated_at, stats, latest_event, latest_invocation, health_score }`.
+  `latest_event`, `latest_invocation`, and `health_score` are `null` until the
+  indexer has produced the corresponding data.
+- `404`: the contract is unknown.
+
+---
+
+### 4.9 Alert notification channels
+
+Critical watchdog alerts are delivered to subscribed channels, each in its
+native format (`services/indexer/internal/watchdog/notifier.go`):
+
+| `channel_type` | Destination | Payload |
+|---|---|---|
+| `webhook` | any http(s) URL | Generic JSON (`contract_id`, `severity`, `message`, `timestamp`, `explorer_url`). |
+| `slack` | Slack incoming webhook (https) | Block Kit: header, contract/severity fields, message, ledger/time context, "View transaction" button. |
+| `discord` | Discord channel webhook (https) | One embed, colored by severity, with contract/severity/ledger fields. |
+| `pagerduty` | Events API v2 (`routing_key`) | `trigger` event; severity mapped Critical→`critical`, Warning→`warning`, Info→`info`; `dedup_key` = `sorolens:<contract>:<tx>` so a re-delivered alert does not open a second incident. |
+
+A 5xx response is retried once; a 4xx is logged and skipped.
+
+#### `POST /api/v1/watchdog/subscriptions`
+
+Contributor role. Body: `{ contract_id, channel_type?, webhook_url?, routing_key?, severity_filter? }`.
+`webhook_url` is required for webhook/slack/discord (https for slack and
+discord); `routing_key` is required for pagerduty and rejected otherwise. The
+contract must be monitored by the watchdog (`422` otherwise).
+
+#### `GET /api/v1/watchdog/subscriptions` · `DELETE /api/v1/watchdog/subscriptions/:id`
+
+Contributor role. Responses never contain secrets: Slack/Discord webhook URLs
+are masked (`https://hooks.slack.com/services/***`) and the PagerDuty key is
+reported only as `has_routing_key`. `DELETE` returns `204`, or `404` for an
+unknown ID.
+
+#### `POST /integrations/slack/commands`
+
+Slack slash command (`/sorolens <contract_id>`), outside `/api/v1` because
+Slack posts form-encoded bodies. Each request is verified against
+`SLACK_SIGNING_SECRET` (HMAC-SHA256 of `v0:<timestamp>:<body>`, constant-time
+compare) and rejected with `401` if the signature is wrong or the timestamp is
+more than five minutes old. Replies with an ephemeral Block Kit status message.
+Returns `404` when no signing secret is configured.
+
+---
+
+### 4.10 Response caching and metrics
+
+`GET /api/v1/contracts`, `GET /api/v1/contracts/:id` and
+`GET /api/v1/watchdog/stats` are cached in Redis for `API_CACHE_TTL`
+(default 30s), keyed by method, path and sorted query string under a namespace
+(`sorolens:cache:<namespace>:…`). Only `200` responses are stored, and scope
+checks run before the cache. A successful `POST /api/v1/contracts` purges the
+`contracts` namespace (SCAN + UNLINK) before the response is sent; watchdog
+stats are written by the indexer, so they expire by TTL. Redis errors fail
+open. Responses carry `X-Cache: HIT|MISS`, and hit/miss counters are exposed
+on `GET /metrics` (see `docs/metrics.md`).
+
+The full machine-readable reference is [`docs/openapi.yaml`](docs/openapi.yaml);
+`make openapi` checks it covers every route, lints it, and regenerates the Go
+client.
+
+---
+
 ## 5. Design Decisions with Rationale
 
 ### 5.1 Cron-driven indexer over a persistent worker
@@ -682,3 +840,43 @@ Upstash Redis is used because it is serverless (no idle cost), has a free tier, 
 - Postgres `WHERE (ledger, id) < (cursor_ledger, cursor_id) ORDER BY ledger DESC, id DESC LIMIT N` uses the composite index efficiently.
 
 **Tradeoff:** Clients cannot jump to an arbitrary page number. This is acceptable for an observability dashboard where users scroll through a feed; it is not a spreadsheet export use case.
+
+---
+
+### 5.5 PWA / Web Push (issue #275)
+
+**Decision:** Ship installability and push-notification delivery as a Progressive Web App (Workbox service worker + VAPID Web Push) rather than a native mobile wrapper.
+
+**Rationale:** A PWA requires no App Store review cycle, works on all major mobile browsers, and can be maintained purely within the existing Next.js codebase. VAPID push is the W3C standard supported natively by all modern browsers and does not require any cloud push SDK.
+
+**New API surface** (Next.js App Router route handlers in `apps/web/app/api/push/`):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET`  | `/api/push/vapid-public-key` | Returns the VAPID public key for `PushManager.subscribe()`. Public by design. |
+| `POST` | `/api/push/subscribe`        | Saves a `PushSubscription` JSON blob (endpoint + keys) to the server-side store. |
+| `DELETE`| `/api/push/subscribe`       | Removes a subscription by endpoint. |
+| `PUT`  | `/api/push/subscribe`        | Internal endpoint: fans out a push payload to all stored subscriptions. Auth-guarded by `PUSH_INTERNAL_SECRET`. |
+
+**Environment variables** (server-side only — never `NEXT_PUBLIC_*`):
+
+| Variable | Purpose |
+|----------|---------|
+| `VAPID_PUBLIC_KEY`   | Base64url-encoded EC P-256 public key |
+| `VAPID_PRIVATE_KEY`  | Base64url-encoded EC P-256 private key |
+| `VAPID_SUBJECT`      | Contact URI for the VAPID JWT (`mailto:` or `https:`) |
+| `PUSH_INTERNAL_SECRET` | Shared secret for the `PUT` push-send endpoint |
+
+**#127 dependency:** Issue #127 ("pluggable notification channels") specifies Slack/Discord/PagerDuty integrations, not Web Push. The server-side alert-triggered push path is **stubbed** — the `PUT /api/push/subscribe` route exists and works, but the indexer/notifier does not yet call it. When #127 or a dedicated push-delivery issue lands, the notifier should call `PUT /api/push/subscribe` with `x-push-secret: $PUSH_INTERNAL_SECRET` when a Critical alert fires. This is documented in `apps/web/app/api/push/subscribe/route.ts`.
+
+**Subscription persistence:** The current `POST /api/push/subscribe` stores subscriptions in-process (a `Map`). This is lost on serverless cold starts. Before enabling push in production, replace the `Map` with a Postgres table (a simple `push_subscriptions(endpoint TEXT PK, keys JSONB, created_at TIMESTAMPTZ)` suffices) and call the Go API to persist it.
+
+**Client-side PWA components:**
+- `apps/web/public/manifest.webmanifest` — Web App Manifest with icons, shortcuts, and `display: standalone`.
+- `apps/web/next.config.ts` — wraps Next.js with `@ducanh2912/next-pwa` (Workbox) to generate a service worker that precaches the app shell and runtime-caches API responses (stale-while-revalidate, 5-minute TTL).
+- `apps/web/lib/alertQueue.ts` — IndexedDB-backed offline alert queue (via `idb`).
+- `apps/web/hooks/useOfflineAlertQueue.ts` — React hook that reads/writes the queue and tracks `navigator.onLine`.
+- `apps/web/hooks/usePushSubscription.ts` — React hook managing the push subscription lifecycle (idle → subscribing → subscribed → denied).
+- `apps/web/components/OfflineAlert.tsx` — `OfflineBanner` (shown when offline) + `OfflineAlertPanel` (the `/offline-alerts` page body).
+- `apps/web/app/offline-alerts/page.tsx` — dedicated page for the queued-alert view.
+

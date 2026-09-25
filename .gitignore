@@ -17,9 +17,11 @@ coverage/
 target/
 
 # Go
+.bin/
 *.exe
 *.test
 sorolens-bin
+**/coverage.out
 /cli/cli
 /services/indexer/indexer
 
