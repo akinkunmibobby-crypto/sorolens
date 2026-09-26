@@ -189,6 +189,27 @@ func TestETagNotAppliedToStreamPaths(t *testing.T) {
 	}
 }
 
+// TestETagStreamPathsAreNotBuffered guards SSE behind ETag: the handler
+// must see an http.Flusher, and bytes must reach the client before the
+// handler returns rather than being held for hashing.
+func TestETagStreamPathsAreNotBuffered(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/events", nil)
+	rec := httptest.NewRecorder()
+	ETag(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("stream handler behind ETag did not receive an http.Flusher")
+		}
+		_, _ = w.Write([]byte("data: first\n\n"))
+		f.Flush()
+		if !rec.Flushed || rec.Body.String() != "data: first\n\n" {
+			t.Errorf("frame was buffered: flushed=%v body=%q", rec.Flushed, rec.Body.String())
+		}
+	})).ServeHTTP(rec, req)
+}
+
 func TestETagOverflowPassesThrough(t *testing.T) {
 	t.Parallel()
 

@@ -103,6 +103,12 @@ func New(h *handler.Handler, maxBodyBytes int64) http.Handler {
 		contributor := middleware.RequireRole(h.Store, h.Logger, middleware.RoleContributor)
 		admin := middleware.RequireRole(h.Store, h.Logger, middleware.RoleAdmin)
 
+		// Request timeouts (issue #154). The SSE stream is registered first
+		// with its own long deadline; r is then rebound so every route
+		// registered below inherits the default cap and returns 503 past it.
+		r.With(scope, middleware.StreamTimeout(h.StreamTimeoutOrDefault())).Get("/stream/events", h.StreamEventsSSE)
+		r = r.With(middleware.Timeout(h.RequestTimeoutOrDefault()))
+
 		get := func(pattern string, fn http.HandlerFunc) { r.With(scope).Get(pattern, fn) }
 
 		// Stats

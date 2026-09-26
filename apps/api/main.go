@@ -74,6 +74,8 @@ func main() {
 		Cache:              &middleware.RedisCache{Client: redisClient},
 		CacheTTL:           cfg.CacheTTL,
 		SlackSigningSecret: cfg.SlackSigningSecret,
+		RequestTimeout:     cfg.RequestTimeout,
+		StreamTimeout:      cfg.StreamTimeout,
 	}
 
 	if err := seedInitialAdmin(context.Background(), h.Store, cfg.InitialAdminGitHubID, logger); err != nil {
@@ -89,9 +91,13 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
-		Handler:      router.New(h, maxBodyBytes),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Handler:     router.New(h, maxBodyBytes),
+		ReadTimeout: 15 * time.Second,
+		// WriteTimeout starts before the handler's own timer, so it must
+		// outlast API_REQUEST_TIMEOUT or the 503 is cut off mid-write and the
+		// client sees a dropped connection. The SSE route extends its own
+		// write deadline per request (middleware.StreamTimeout).
+		WriteTimeout: cfg.RequestTimeout + 5*time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 

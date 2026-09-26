@@ -59,6 +59,12 @@ type Handler struct {
 	// SlackSigningSecret verifies Slack slash command requests (issue #127).
 	// Empty disables the Slack command endpoint.
 	SlackSigningSecret string
+	// RequestTimeout caps handling of every /api/v1 route except the SSE
+	// stream (issue #154). Zero means middleware.DefaultRequestTimeout.
+	RequestTimeout time.Duration
+	// StreamTimeout bounds one SSE connection. Zero means
+	// middleware.DefaultStreamTimeout.
+	StreamTimeout time.Duration
 
 	// ReportSigningKey signs exported SLA reports (issue #266). When empty the
 	// reporting handlers fall back to REPORT_SIGNING_KEY; with neither set the
@@ -69,4 +75,21 @@ type Handler struct {
 	// process-wide memo for composite per-contract dashboard summaries.
 	summaryCacheOnce sync.Once
 	summaryCacheVal  *SummaryCache
+}
+
+// RequestTimeoutOrDefault returns RequestTimeout, or the default when unset.
+// Handlers built in tests and the serverless entrypoint leave it zero.
+func (h *Handler) RequestTimeoutOrDefault() time.Duration {
+	if h.RequestTimeout > 0 {
+		return h.RequestTimeout
+	}
+	return middleware.DefaultRequestTimeout
+}
+
+// StreamTimeoutOrDefault returns StreamTimeout, or the default when unset.
+func (h *Handler) StreamTimeoutOrDefault() time.Duration {
+	if h.StreamTimeout > 0 {
+		return h.StreamTimeout
+	}
+	return middleware.DefaultStreamTimeout
 }

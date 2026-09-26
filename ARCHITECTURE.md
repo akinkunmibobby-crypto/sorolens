@@ -658,6 +658,24 @@ Network-wide summary across all tracked contracts.
 
 ---
 
+### 4.8 Request timeouts
+
+Every `/api/v1` route runs under `API_REQUEST_TIMEOUT` (default 30s,
+`middleware.Timeout`, built on `http.TimeoutHandler`). The request context is
+cancelled at the deadline so in-flight store queries abort, and a handler that
+has not finished gets a `503` with the standard error envelope
+(`code: TIMEOUT`). The response is buffered, so late writes from a slow handler
+are discarded instead of racing the 503.
+
+`GET /api/v1/stream/events` (SSE) is registered outside that cap and runs
+under `API_STREAM_TIMEOUT` (default 5m, `middleware.StreamTimeout`): the
+response is not buffered, the connection write deadline is extended to match,
+and at the deadline the context is cancelled so the stream closes and
+`EventSource` reconnects. The server `WriteTimeout` is set to
+`API_REQUEST_TIMEOUT + 5s` so it never cuts off the 503.
+
+---
+
 ## 5. Design Decisions with Rationale
 
 ### 5.1 Cron-driven indexer over a persistent worker
