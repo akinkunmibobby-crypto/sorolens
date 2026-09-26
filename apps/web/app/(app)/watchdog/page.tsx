@@ -93,7 +93,7 @@ export default function WatchdogPage() {
         if (seq === loadSeq.current) setContractsLoading(false);
       }
     },
-    [network],
+    [network]
   );
 
   useEffect(() => {

@@ -105,6 +105,12 @@ export interface VolumePoint {
   count: number;
 }
 
+/** One hour bucket of invocation frequency (issue #185). */
+export interface InvocationFrequencyPoint {
+  hour: string; // "HH:00" UTC hour start
+  count: number;
+}
+
 export interface StatsResponse {
   event_volume: VolumePoint[];
   invocation_count: VolumePoint[];
@@ -139,6 +145,12 @@ export interface ContractsListResponse {
 export interface TrackContractRequest {
   id: string;
   label?: string;
+}
+
+export interface LabelResolution {
+  label: string;
+  value: string;
+  scope: string;
 }
 
 export type TimeWindow = "24h" | "7d" | "30d" | "all";
@@ -364,4 +376,3 @@ export interface AlertSubscription {
 export interface SubscriptionsResponse {
   subscriptions: AlertSubscription[];
 }
-

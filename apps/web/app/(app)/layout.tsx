@@ -13,6 +13,14 @@ import { NetworkProvider } from "@/lib/network";
 import { NetworkSelector } from "@/components/NetworkSelector";
 import { Breadcrumbs } from "@/components/Breadcrumbs";
 import { CmdkSearch } from "@/components/CmdkSearch";
+import { LastUpdated } from "@/components/LastUpdated";
+import { OfflineBanner } from "@/components/OfflineAlert";
+import { PushSubscribeButton } from "@/components/PushSubscribeButton";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import { useOfflineAlertQueue } from "@/hooks/useOfflineAlertQueue";
+
+function AppLayoutInner({ children }: { children: React.ReactNode }) {
+  const { pending, isOffline } = useOfflineAlertQueue();
 
   return (
     <>
@@ -68,6 +76,7 @@ import { CmdkSearch } from "@/components/CmdkSearch";
         <main>{children}</main>
         <footer className="mt-12 border-t border-[var(--color-border)] pt-6 text-sm text-[var(--color-text-secondary)]">
           Built for the Stellar developer community.
+          <LastUpdated />
         </footer>
       </div>
     </>

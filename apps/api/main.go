@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/exaring/otelpgx"
+	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/sorolens/sorolens/apps/api/internal/config"
@@ -31,13 +32,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	config, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if cfg.SentryDSN != "" {
+		if err := sentry.Init(sentry.ClientOptions{
+			Dsn:         cfg.SentryDSN,
+			Environment: cfg.SentryEnvironment,
+		}); err != nil {
+			logger.Error("sentry init", "err", err)
+		} else {
+			defer sentry.Flush(2 * time.Second)
+		}
+	}
+
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("parse config", "err", err)
 		os.Exit(1)
 	}
-	config.ConnConfig.Tracer = otelpgx.NewTracer()
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 	if err != nil {
 		logger.Error("postgres connect", "err", err)
 		os.Exit(1)
@@ -69,9 +81,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	maxBodyBytes, err := config.MaxBodyBytesFromEnv()
+	if err != nil {
+		logger.Error("config", "err", err)
+		os.Exit(1)
+	}
+
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
-		Handler:      router.New(h, cfg.RequestMaxBodyBytes),
+		Handler:      router.New(h, maxBodyBytes),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
