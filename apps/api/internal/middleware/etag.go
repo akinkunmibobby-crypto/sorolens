@@ -62,6 +62,11 @@ var etagExcludedPaths = []string{
 	"/stream/events",
 	"/events/stream",
 	"/ws",
+	// Bulk CSV exports are generated per request and sent with
+	// Cache-Control: no-store. Buffering them would defeat the streaming
+	// response, and emitting a validator for a no-store entity invites
+	// 304s that contradict the caching directive.
+	"/events.csv",
 }
 
 // etagExcludedPath reports whether the request path is an event stream or

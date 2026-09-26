@@ -269,3 +269,27 @@ func TestIfNoneMatchMatches(t *testing.T) {
 		})
 	}
 }
+
+// TestETagNotAppliedToCSVExports keeps bulk CSV exports out of the validator
+// path. They are generated per request and sent with Cache-Control: no-store,
+// so buffering them would defeat streaming and a validator would invite 304s
+// that contradict the directive.
+func TestETagNotAppliedToCSVExports(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/contracts/C1/events.csv", nil)
+	// A wildcard would otherwise match any 200 and produce a bodyless 304.
+	req.Header.Set("If-None-Match", "*")
+	rec := httptest.NewRecorder()
+	ETag(etagJSONHandler("id,type\ne1,contract\n")).ServeHTTP(rec, req)
+
+	if rec.Header().Get("ETag") != "" {
+		t.Fatalf("CSV exports must not be tagged, got %q", rec.Header().Get("ETag"))
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CSV export must not be answered with 304, got %d", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "e1") {
+		t.Fatalf("expected the CSV body to be delivered, got %q", body)
+	}
+}

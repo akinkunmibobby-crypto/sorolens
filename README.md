@@ -174,6 +174,9 @@ sorolens/
   contracts/
     counter/      Rust Soroban fixture contract
     watchdog/     Rust Soroban watchdog contract (on-chain health tracking)
+  deploy/
+    terraform/    Self-hosting Terraform modules (AWS; see docs/self-hosting/aws.md)
+    pulumi/       Self-hosting Pulumi (TypeScript) components, mirroring terraform/
   docs/
     screenshots/  Screenshot placeholders
 ```

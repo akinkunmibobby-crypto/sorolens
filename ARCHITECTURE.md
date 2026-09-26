@@ -444,6 +444,42 @@ Paginated event list for a contract.
 }
 ```
 
+#### `GET /api/v1/contracts/:id/events.csv`
+
+Flat CSV export of a contract's events, for handing the whole history to a
+spreadsheet or an analyst in one request. Rows are streamed straight from the
+query, so memory use in the API does not grow with the size of the export.
+Served as a download with `Content-Type: text/csv; charset=utf-8` and
+`Content-Disposition: attachment; filename="<id>-events.csv"`.
+
+**Query params:** `network`, `type`, `from` / `to` (inclusive ledger bounds).
+`topic` and `in_successful_call` are not supported here, and there is no `cursor`
+and no `limit`: an export is meant to be complete.
+
+**Columns** (in order): `id`, `contract_id`, `network`, `ledger`,
+`ledger_closed_at`, `tx_hash`, `type`, `topic_xdr`, `value_xdr`,
+`topic_decoded`, `value_decoded`, `in_successful_call`. The three `*_xdr` /
+`*_decoded` columns hold JSON.
+
+**Responses:**
+- `200`: the header row, then one row per matching event ordered by
+  `(ledger, id)` ascending. The export is deterministic, so an unchanged store
+  produces an identical file and a diff means the data changed. An unknown
+  contract yields the header row with no data rows, matching the JSON listing.
+- `422`: `network` is not a known network, a ledger bound is not a positive
+  integer, or `from` is greater than `to`.
+
+Two details worth knowing before opening a downloaded file:
+
+- Free-text columns (`type`, `value_xdr`) are prefixed with an apostrophe when
+  they start with `=`, `+`, `-` or `@`, because a spreadsheet would otherwise
+  evaluate a contract-supplied value as a formula. The JSON columns are left
+  alone: they always open with a bracket, a quote or a digit.
+- The response is committed as soon as the first byte is written, so a store
+  failure part-way through a large export is logged rather than turned into an
+  error status. A failure before any row is written still answers `500` with a
+  JSON error body.
+
 ---
 
 ### 4.3 Invocations
@@ -634,7 +670,6 @@ Revoke a key. Returns `204`.
 ---
 
 ### 4.7 Stats
-### 4.5 Stats
 
 #### `GET /api/v1/stats/global`
 
@@ -673,6 +708,55 @@ response is not buffered, the connection write deadline is extended to match,
 and at the deadline the context is cancelled so the stream closes and
 `EventSource` reconnects. The server `WriteTimeout` is set to
 `API_REQUEST_TIMEOUT + 5s` so it never cuts off the 503.
+
+---
+
+### 4.9 Live dashboard feeds
+
+The `/live` page (issue #139) polls two bounded, non-paginated reads.
+
+#### `GET /api/v1/events/recent?limit=50`
+
+The newest events across every tracked contract, ordered by
+`ledger_closed_at DESC`. The ticker de-duplicates by event `id`, so no cursor is
+needed and a repeated poll that returns already-rendered rows is a no-op.
+
+#### `GET /api/v1/stats/activity?minutes=30`
+
+One entry per contract that emitted at least one event in the last `minutes`
+minutes, ordered hottest first. Each entry carries `per_minute`: exactly
+`minutes` one-minute buckets, oldest first, zero-filled. Bucket boundaries are
+aligned to the wall-clock minute so two consecutive polls agree on the x-axis
+and a sparkline never shifts under the reader.
+
+#### `POST /api/v1/contracts/validate`
+
+Read-only pre-flight check for the tracking wizard (issue #140). Body:
+`{"contract_id": "C...", "network": "testnet"}`. It validates the StrKey —
+base32-decoding the payload, checking the contract version byte, and verifying
+the CRC16-XModem checksum — which catches a mistyped character that the
+length-only check used by registration cannot. It also reports
+`already_tracked` so the wizard can redirect instead of creating a duplicate.
+It never writes.
+
+---
+
+### 4.10 API v2
+
+`/api/v2/*` mirrors `/api/v1/*` route for route with a consistent response
+contract:
+
+- every list endpoint returns
+  `{"data": [...], "pagination": {"next_cursor", "has_more"}}`
+- every list endpoint accepts `cursor` and `limit`, and always returns
+  `pagination`
+- every timestamp is RFC 3339 UTC; optional fields are explicit `null`
+- errors keep the v1 `{"error": {"code", "message", "request_id"}}` shape
+
+Scopes and roles are identical in both namespaces. `docs/api-v2.md` is the
+field-by-field v1 → v2 mapping, and `docs/openapi.yaml` documents both
+namespaces. Route parity is enforced by `TestV2CoversEveryV1Route`, which walks
+the chi route table and fails if a v1 route has no v2 counterpart.
 
 ---
 
@@ -734,7 +818,57 @@ Upstash Redis is used because it is serverless (no idle cost), has a free tier, 
 
 ---
 
-### 5.5 PWA / Web Push (issue #275)
+### 5.5 A parallel v2 namespace over a frozen v1
+
+**Decision:** Introduce `/api/v2/*` as a new route subtree rather than
+versioning individual endpoints or rewriting v1 in place.
+
+**Rationale:** v1 is consumed by the dashboard, the CLI, and the generated Go
+client simultaneously. Changing its response shapes would break all three at
+once. A parallel namespace lets the accumulated inconsistencies be fixed
+(uniform list envelope, unambiguous field names, ISO 8601 timestamps
+everywhere) without a coordinated client migration, and lets each consumer move
+endpoint by endpoint. Both namespaces share the same store and middleware, so
+there is no duplicated query logic and scopes and roles behave identically.
+
+**Tradeoff:** Two handler layers must be kept in step. A route-parity test
+guards the surface mechanically, and the DTO duplication is deliberate: that
+duplication *is* the versioning contract.
+
+---
+
+### 5.6 Parquet cold storage with a pure-Go reader
+
+**Decision:** Events older than `COLD_STORAGE_THRESHOLD_DAYS` (default 90) are
+exported to Parquet objects in an S3-compatible bucket and then deleted from
+Postgres. A scheduled job (`apps/api/cmd/coldarchive`) performs the export, and
+the API falls back to the archive when a queried ledger range is no longer in
+the hot store.
+
+**Rationale:** Postgres storage is the dominant cost at scale, while historical
+events are read rarely and almost always in ledger order. One Parquet object per
+contract per calendar month keeps reads cheap and the layout comprehensible by
+non-Go tools.
+
+**Write-before-delete:** export and delete are separate steps, and the delete
+only runs after the object is durable, so a failed upload can never lose data.
+Re-archiving a month merges into the existing object and de-duplicates by event
+id, which makes the job idempotent and safe to re-run.
+
+**Not embedded DuckDB:** the issue suggested loading the Parquet with DuckDB
+embedded. That requires cgo and a multi-minute C++ build in every environment
+that compiles the API, including CI, so the reader uses a pure-Go Parquet
+library instead. The on-disk format is unchanged, so a DuckDB-backed reader can
+consume the same objects later without a migration.
+
+**Tradeoff:** an archive-backed query lists and decodes every object for the
+contract, so it is materially slower than the Postgres path. That is the
+accepted cost of the cold tier (issue #146 asks for "slower but succeeds"), and
+the one-object-per-month layout bounds the work to the months touched.
+
+---
+
+### 5.7 PWA / Web Push (issue #275)
 
 **Decision:** Ship installability and push-notification delivery as a Progressive Web App (Workbox service worker + VAPID Web Push) rather than a native mobile wrapper.
 
@@ -770,4 +904,3 @@ Upstash Redis is used because it is serverless (no idle cost), has a free tier, 
 - `apps/web/hooks/usePushSubscription.ts` — React hook managing the push subscription lifecycle (idle → subscribing → subscribed → denied).
 - `apps/web/components/OfflineAlert.tsx` — `OfflineBanner` (shown when offline) + `OfflineAlertPanel` (the `/offline-alerts` page body).
 - `apps/web/app/offline-alerts/page.tsx` — dedicated page for the queued-alert view.
-
